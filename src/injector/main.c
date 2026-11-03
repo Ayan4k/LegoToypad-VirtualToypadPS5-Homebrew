@@ -446,13 +446,9 @@ static int write_code(pid_t pid, intptr_t addr, const void *buf, size_t len) {
     kernel_mprotect(pid, page, span, PROT_READ | PROT_WRITE | PROT_EXEC);
     int r = kernel_proc_copyin(pid, buf, addr, len);
     if (prot > 0) kernel_mprotect(pid, page, span, prot);
-    if (r) return -1;
-    for (size_t o = 0; o < len; o += 32) {   /* read back in chunks: callers may write more than 32 bytes */
-        uint8_t chk[32];
-        size_t n = len - o < sizeof chk ? len - o : sizeof chk;
-        if (kernel_proc_copyout(pid, addr + o, chk, n) || memcmp(chk, (const uint8_t *)buf + o, n)) return -1;
-    }
-    return 0;
+    uint8_t chk[32];
+    kernel_proc_copyout(pid, addr, chk, len);
+    return (r || memcmp(chk, buf, len)) ? -1 : 0;
 }
 
 /* Code shift: EU CUSA01176 v01.24 is the same build layout as US v01.23 except that the code from
@@ -524,100 +520,6 @@ static const struct { uint32_t off; uint16_t stock; uint8_t is_w; } RES_SITES[6]
     {0x7148f8, 1920, 1}, {0x714902, 1080, 0}, {0x714edc, 1920, 1},   /* patch addresses - 0x400000 */
     {0x714ee3, 1080, 0}, {0x714f23, 1920, 1}, {0x714f28, 1080, 0}};
 
-/* PS4 Pro ("Neo") support code from the CUSA00935 v01.23 cheat file (Gregorious). The cheat's
- * "Native 4K" / "1440p" entries are NOT only the six size values above: they also carry these extra
- * patches, and the game needs them once the render targets are bigger than 1080p. Without them only
- * the six sizes change and the game crashes. Addresses in the cheat file include the 0x400000 image
- * base, so every offset here is (cheat address - 0x400000).
- *
- *  - six call sites are redirected into small functions placed in unused padding (0x2ab1400..)
- *    - GNM surface size/alignment wrapper: size + size/8, rounded up to 64 KB, alignment >= 64 KB
- *    - three "check the result of the GNM call" wrappers (trap with ud2 if the call fails)
- *    - one loop that sets bit 31 of the flags (+0xa0) of every render target in the list
- *  - two flag changes in the allocation code (clear bit 5 of a byte, or 0x20000000 into edx).
- *
- * Stock bytes of the six call sites are derived from the cheat (target of the wrapper's own call),
- * so nothing is written unless the build matches. The two flag sites have no known stock bytes; they
- * are only written after all six call sites matched. EU v01.24 has different call targets, so the
- * check fails there and nothing is changed (the game stays at 1080p). */
-#define NEO_CAVE_COUNT 5
-static const uint8_t NEO_CAVE_SURF[] = {   /* @ 0x2ab1580 */
-    0x48,0x83,0xec,0x28,0x48,0x8b,0x44,0x24,0x30,0x48,0x89,0x04,0x24,0x48,0x8b,0x44,0x24,0x38,0x48,0x89,0x44,0x24,0x08,
-    0x48,0x8b,0x44,0x24,0x40,0x48,0x89,0x44,0x24,0x10,0x48,0x8b,0x44,0x24,0x48,0x48,0x89,0x44,0x24,0x18,0xe8,0x70,0x64,
-    0x4a,0xff,0x48,0x83,0xc4,0x28,0x48,0x89,0xc1,0x48,0xc1,0xe9,0x20,0x81,0xf9,0x00,0x00,0x01,0x00,0x73,0x05,0xb9,0x00,
-    0x00,0x01,0x00,0x89,0xc2,0xc1,0xea,0x03,0x01,0xd0,0x05,0xff,0xff,0x00,0x00,0x25,0x00,0x00,0xff,0xff,0x48,0xc1,0xe1,
-    0x20,0x48,0x09,0xc8,0xc3};
-static const uint8_t NEO_CAVE_CHK1[] = {   /* @ 0x2ab1480 */
-    0x48,0x83,0xec,0x28,0x48,0x8b,0x44,0x24,0x30,0x48,0x89,0x04,0x24,0x48,0x8b,0x44,0x24,0x38,0x48,0x89,0x44,0x24,0x08,
-    0x48,0x8b,0x44,0x24,0x40,0x48,0x89,0x44,0x24,0x10,0xe8,0x4a,0x7c,0x4a,0xff,0x48,0x83,0xc4,0x28,0x85,0xc0,0x78,0x01,
-    0xc3,0x89,0xc1,0x48,0x0f,0xba,0xe9,0x21,0x0f,0x0b};
-static const uint8_t NEO_CAVE_CHK2[] = {   /* @ 0x2ab14d0 */
-    0x48,0x83,0xec,0x28,0x48,0x8b,0x44,0x24,0x30,0x48,0x89,0x04,0x24,0x48,0x8b,0x44,0x24,0x38,0x48,0x89,0x44,0x24,0x08,
-    0x48,0x8b,0x44,0x24,0x40,0x48,0x89,0x44,0x24,0x10,0xe8,0xfa,0x7b,0x4a,0xff,0x48,0x83,0xc4,0x28,0x85,0xc0,0x78,0x01,
-    0xc3,0x89,0xc1,0x48,0x0f,0xba,0xe9,0x22,0x0f,0x0b};
-static const uint8_t NEO_CAVE_CHK3[] = {   /* @ 0x2ab1520 */
-    0x48,0x83,0xec,0x08,0xe8,0xb7,0x7b,0x4a,0xff,0x48,0x83,0xc4,0x08,0x85,0xc0,0x78,0x01,0xc3,0x89,0xc1,0x48,0x0f,0xba,
-    0xe9,0x23,0x0f,0x0b};
-static const uint8_t NEO_CAVE_CHK4[] = {   /* @ 0x2ab1400 */
-    0x48,0x83,0xec,0x08,0xe8,0x17,0xa0,0x90,0xff,0x48,0x83,0xc4,0x08,0x85,0xc0,0x78,0x01,0xc3,0x89,0xc1,0x89,0x01,0x0f,
-    0x0b};
-static const uint8_t NEO_CAVE_FLAGS[] = {  /* @ 0x2ab1600 */
-    0x50,0x53,0x51,0x52,0x31,0xdb,0x41,0x3b,0x9d,0x10,0x07,0x00,0x00,0x73,0x1e,0x48,0x8d,0x04,0x5b,0x49,0x8b,0x84,0xc5,
-    0x18,0x07,0x00,0x00,0x48,0x8b,0x40,0x58,0x81,0x88,0xa0,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0xff,0xc3,0xeb,0xd9,0x5a,
-    0x59,0x5b,0x58,0xe9,0xda,0x9d,0x90,0xff};
-static const struct { uint32_t off; const uint8_t *bytes; size_t len; } NEO_CAVES[] = {
-    {0x2ab1580, NEO_CAVE_SURF, sizeof NEO_CAVE_SURF}, {0x2ab1480, NEO_CAVE_CHK1, sizeof NEO_CAVE_CHK1},
-    {0x2ab14d0, NEO_CAVE_CHK2, sizeof NEO_CAVE_CHK2}, {0x2ab1520, NEO_CAVE_CHK3, sizeof NEO_CAVE_CHK3},
-    {0x2ab1400, NEO_CAVE_CHK4, sizeof NEO_CAVE_CHK4}, {0x2ab1600, NEO_CAVE_FLAGS, sizeof NEO_CAVE_FLAGS}};
-static const struct { uint32_t off; uint8_t stock[5]; uint8_t patched[5]; } NEO_CALLS[6] = {
-    {0x719a43, {0xe8,0xd8,0xdf,0x83,0x01}, {0xe8,0x38,0x7b,0x39,0x02}},
-    {0x7151e2, {0xe8,0x09,0x3f,0x84,0x01}, {0xe8,0x99,0xc2,0x39,0x02}},
-    {0x1f6206b, {0xe8,0x80,0x70,0xff,0xff}, {0xe8,0x60,0xf4,0xb4,0x00}},
-    {0x1f61c85, {0xe8,0x56,0x74,0xff,0xff}, {0xe8,0x96,0xf8,0xb4,0x00}},
-    {0x714a85, {0xe8,0x96,0x69,0xca,0x01}, {0xe8,0x76,0xc9,0x39,0x02}},
-    {0x714a69, {0xe8,0xa2,0x69,0xca,0x01}, {0xe8,0x92,0xcb,0x39,0x02}}};
-static const uint8_t NEO_FLAG_A[8] = {0x41,0x80,0xa6,0x13,0x11,0x00,0x00,0xdf};   /* and byte [r14+0x1113],0xdf */
-static const uint8_t NEO_FLAG_B[6] = {0x81,0xca,0x00,0x00,0x00,0x20};             /* or edx,0x20000000 */
-#define NEO_OFF_FLAG_A 0x719994
-#define NEO_OFF_FLAG_B 0x71999c
-
-/* 1 = installed (or already there), 0 = build does not match, nothing written, -1 = write failed */
-static int apply_neo_patches(pid_t pid, intptr_t base) {
-    int present = 0;
-    for (int i = 0; i < 6; i++) {
-        uint8_t cur[5];
-        if (kernel_proc_copyout(pid, base + NEO_CALLS[i].off, cur, 5)) { LOG("neo: read failed at +0x%x", NEO_CALLS[i].off); return 0; }
-        if (!memcmp(cur, NEO_CALLS[i].patched, 5)) { present++; continue; }
-        if (memcmp(cur, NEO_CALLS[i].stock, 5)) {
-            LOG("neo: +0x%x holds %02x %02x %02x %02x %02x, not the expected stock call; not patching",
-                NEO_CALLS[i].off, cur[0], cur[1], cur[2], cur[3], cur[4]);
-            return 0;
-        }
-    }
-    if (present == 6) { LOG("neo: support code already present"); return 1; }
-    if (present) { LOG("neo: only %d of 6 call sites patched; not touching them", present); return 0; }
-    /* 1) the new functions go in first (nothing calls them yet) */
-    for (size_t i = 0; i < sizeof NEO_CAVES / sizeof NEO_CAVES[0]; i++) {
-        uint8_t was[4] = {0};
-        kernel_proc_copyout(pid, base + NEO_CAVES[i].off, was, 4);
-        LOG("neo: function at +0x%x (was %02x %02x %02x %02x, %zu bytes)", NEO_CAVES[i].off, was[0], was[1], was[2], was[3], NEO_CAVES[i].len);
-        if (write_code(pid, base + NEO_CAVES[i].off, NEO_CAVES[i].bytes, NEO_CAVES[i].len)) { LOG("neo: write failed at +0x%x", NEO_CAVES[i].off); return -1; }
-    }
-    /* 2) the two flag changes */
-    uint8_t fa[8], fb[6];
-    kernel_proc_copyout(pid, base + NEO_OFF_FLAG_A, fa, 8);
-    kernel_proc_copyout(pid, base + NEO_OFF_FLAG_B, fb, 6);
-    LOG("neo: flag site A was %02x %02x %02x %02x %02x %02x %02x %02x", fa[0], fa[1], fa[2], fa[3], fa[4], fa[5], fa[6], fa[7]);
-    LOG("neo: flag site B was %02x %02x %02x %02x %02x %02x", fb[0], fb[1], fb[2], fb[3], fb[4], fb[5]);
-    if (write_code(pid, base + NEO_OFF_FLAG_A, NEO_FLAG_A, sizeof NEO_FLAG_A) ||
-        write_code(pid, base + NEO_OFF_FLAG_B, NEO_FLAG_B, sizeof NEO_FLAG_B)) { LOG("neo: flag write failed"); return -1; }
-    /* 3) last: switch the six calls over to the new functions */
-    for (int i = 0; i < 6; i++)
-        if (write_code(pid, base + NEO_CALLS[i].off, NEO_CALLS[i].patched, 5)) { LOG("neo: call patch failed at +0x%x", NEO_CALLS[i].off); return -1; }
-    LOG("neo: PS4 Pro support code installed");
-    return 1;
-}
-
 /* Safety net for the higher resolutions. On a real console a PS4 game keeps a PS4-sized memory
  * budget, and 4K render targets may not fit: the game then hangs during start-up and closes
  * before it ever talks to the toy pad. Every launch above 1080 is a trial (res_trial.txt). It
@@ -659,8 +561,6 @@ static void apply_resolution(pid_t pid, intptr_t base) {
     case 2160: w = 3840; h = 2160; break;
     default: LOG("resolution=%u not supported (use 1080, 1440 or 2160); keeping default", res); return;
     }
-    /* the extra code from the cheat file's 1440p / 4K entries must be in place first */
-    if (apply_neo_patches(pid, base) != 1) { LOG("resolution: PS4 Pro support code not installed; staying at 1080p"); return; }
     uint16_t cur[6];
     for (int i = 0; i < 6; i++) {
         if (kernel_proc_copyout(pid, base + RES_SITES[i].off, &cur[i], 2)) { LOG("resolution: read failed"); return; }
